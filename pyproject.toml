@@ -1,0 +1,19 @@
+[tool.poetry]
+include = ["MANIFEST.skao.int"]
+name = "ska-tango-event-monitor"
+version = "0.0.0"
+description = "Monitor the Tango event system"
+authors = ["Thomas Ives <tri@observatorysciences.co.uk>"]
+license = "BSD-3-Clause"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+pytango = "*"
+
+[tool.poetry.scripts]
+ska-tango-event-monitor = "ska_tango_event_monitor.event_monitor:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
