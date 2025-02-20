@@ -1,0 +1,754 @@
+From df5bbd370d86f9cb70ded9f607e101d3af0ec5ee Mon Sep 17 00:00:00 2001
+From: Thomas Ives <tri@observatorysciences.co.uk>
+Date: Wed, 12 Feb 2025 10:33:20 +0000
+Subject: [PATCH 2/3] Add performance monitoring to the event system
+
+---
+ CMakeLists.txt                            |   2 +-
+ src/client/zmqeventconsumer.cpp           | 101 +++++++++++++++-
+ src/include/tango/client/eventconsumer.h  |  35 +++++-
+ src/include/tango/common/utils/perf_mon.h | 139 ++++++++++++++++++++++
+ src/include/tango/server/dserver.h        |   2 +
+ src/include/tango/server/dserverclass.h   |  26 ++++
+ src/include/tango/server/eventsupplier.h  |  22 ++++
+ src/server/dserver.cpp                    |  54 ++++++++-
+ src/server/dserverclass.cpp               |  38 ++++++
+ src/server/zmqeventsupplier.cpp           |  49 ++++++--
+ 10 files changed, 447 insertions(+), 21 deletions(-)
+ create mode 100644 src/include/tango/common/utils/perf_mon.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b3c5534b..ace7026d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -51,7 +51,7 @@ endif()
+ #need to define the version of the library
+ set(MAJOR_VERSION "9")
+ set(MINOR_VERSION "5")
+-set(PATCH_VERSION "0")
++set(PATCH_VERSION "1234")
+ 
+ if(WIN32)
+     include(configure/cmake_win_defs.cmake)
+diff --git a/src/client/zmqeventconsumer.cpp b/src/client/zmqeventconsumer.cpp
+index e8def231..255e72ce 100644
+--- a/src/client/zmqeventconsumer.cpp
++++ b/src/client/zmqeventconsumer.cpp
+@@ -197,6 +197,9 @@ void *ZmqEventConsumer::run_undetached(TANGO_UNUSED(void *arg))
+     // Enter the infinite loop
+     //
+ 
++    PerfMonSample sample;
++    bool perf_mon_sampling = false;
++    PerfClock::time_point last_event_timestamp = {};
+     while(1)
+     {
+         zmq::message_t received_event_name, received_endian;
+@@ -216,8 +219,19 @@ void *ZmqEventConsumer::run_undetached(TANGO_UNUSED(void *arg))
+         // Wait for message. The try/catch is usefull when the process is running under gdb control
+         //
+ 
++        if(!perf_mon_sampling && perf_lock.try_lock())
++        {
++            perf_mon_sampling = perf_mon_enabled;
++            if(!perf_mon_enabled)
++            {
++                last_event_timestamp = {};
++            }
++            perf_lock.unlock();
++        }
++
+         try
+         {
++            TimeBlockMicros time_block(perf_mon_sampling, &sample.sleep_micros);
+             zmq::poll(items, nb_poll_item);
+             // TANGO_LOG << "Awaken !!!!!!!!" << std::endl;
+         }
+@@ -229,6 +243,11 @@ void *ZmqEventConsumer::run_undetached(TANGO_UNUSED(void *arg))
+             }
+         }
+ 
++        if(perf_mon_sampling)
++        {
++            sample.wake_count++; // We don't care about spurious wakes here
++        }
++
+         //
+         // Something received by the heartbeat socket ?
+         //
+@@ -284,6 +303,19 @@ void *ZmqEventConsumer::run_undetached(TANGO_UNUSED(void *arg))
+ 
+         if(items[2].revents & ZMQ_POLLIN)
+         {
++            bool enabled = perf_mon_sampling;
++            perf_mon_sampling = false;
++            SamplePusher<PerfMonSample> pusher{enabled, sample, perf_ring_buffer, &perf_lock};
++            TimeBlockMicros time_block{enabled, &sample.process_micros};
++
++            if(enabled)
++            {
++                if(last_event_timestamp != PerfClock::time_point{})
++                {
++                    sample.micros_since_last_event = duration_micros(last_event_timestamp, time_block.start);
++                }
++                last_event_timestamp = time_block.start;
++            }
+             try
+             {
+                 auto res = event_sub_sock->recv(received_event_name, zmq::recv_flags::dontwait);
+@@ -322,7 +354,11 @@ void *ZmqEventConsumer::run_undetached(TANGO_UNUSED(void *arg))
+                     continue;
+                 }
+ 
+-                process_event(received_event_name, received_endian, received_call, received_event_data);
++                process_event(received_event_name,
++                              received_endian,
++                              received_call,
++                              received_event_data,
++                              enabled ? &sample : nullptr);
+             }
+             catch(zmq::error_t &e)
+             {
+@@ -513,7 +549,8 @@ void ZmqEventConsumer::process_heartbeat(zmq::message_t &received_event_name,
+ void ZmqEventConsumer::process_event(zmq::message_t &received_event_name,
+                                      zmq::message_t &received_endian,
+                                      zmq::message_t &received_call,
+-                                     zmq::message_t &event_data)
++                                     zmq::message_t &event_data,
++                                     PerfMonSample *sample)
+ {
+     // TANGO_LOG << "event name message adr = " << (void *)(&received_event_name) << " - size = " <<
+     // received_event_name.size() << " - ptr = " << (void *)(received_event_name.data()) << std::endl; TANGO_LOG <<
+@@ -594,7 +631,7 @@ void ZmqEventConsumer::process_event(zmq::message_t &received_event_name,
+     // Call the event method
+     //
+ 
+-    push_zmq_event(event_name, endian, event_data, receiv_call->call_is_except, receiv_call->ctr);
++    push_zmq_event(event_name, endian, event_data, receiv_call->call_is_except, receiv_call->ctr, sample);
+ }
+ 
+ //-------------------------------------------------------------------------------------------------------------------
+@@ -1087,6 +1124,20 @@ void ZmqEventConsumer::multi_tango_host(zmq::socket_t *sock, SocketCmd cmd, cons
+     }
+ }
+ 
++void ZmqEventConsumer::start_perf_mon()
++{
++    std::lock_guard<std::mutex> lg{perf_lock};
++    perf_mon_enabled = true;
++    last_event_timestamp = {};
++    perf_ring_buffer.reset();
++}
++
++void ZmqEventConsumer::stop_perf_mon()
++{
++    std::lock_guard<std::mutex> lg{perf_lock};
++    perf_mon_enabled = false;
++}
++
+ void ZmqEventConsumer::query_event_system(std::ostream &os)
+ {
+     os << "{\"event_callbacks\":{";
+@@ -1105,6 +1156,7 @@ void ZmqEventConsumer::query_event_system(std::ostream &os)
+             char buffer[128];
+             std::strftime(buffer, 128, "%Y-%m-%dT%H:%M:%S", std::gmtime(&pair.second.last_subscribed));
+             os << ",\"last_subscribed\":\"" << (const char *) buffer << "\"";
++            os << "}";
+             first = false;
+         }
+     }
+@@ -1119,10 +1171,25 @@ void ZmqEventConsumer::query_event_system(std::ostream &os)
+             }
+             os << "\"" << pair.first << "\":{";
+             os << "\"endpoint\":\"" << pair.second.endpoint << "\"";
++            os << "}";
+             first = false;
+         }
+     }
+-    os << "}}";
++    os << "},\"perf_stats\":";
++    if(perf_mon_enabled)
++    {
++        RingBuffer<PerfMonSample> buffer;
++        {
++            std::lock_guard<std::mutex> lg{perf_lock};
++            buffer = perf_ring_buffer;
++        }
++        buffer.json_dump(os);
++    }
++    else
++    {
++        os << "null";
++    }
++    os << "}";
+ }
+ 
+ //--------------------------------------------------------------------------------------------------------------------
+@@ -1952,8 +2019,12 @@ void ZmqEventConsumer::push_heartbeat_event(std::string &ev_name)
+ //
+ //--------------------------------------------------------------------------------------------------------------------
+ 
+-void ZmqEventConsumer::push_zmq_event(
+-    std::string &ev_name, unsigned char endian, zmq::message_t &event_data, bool error, const DevULong &ds_ctr)
++void ZmqEventConsumer::push_zmq_event(std::string &ev_name,
++                                      unsigned char endian,
++                                      zmq::message_t &event_data,
++                                      bool error,
++                                      const DevULong &ds_ctr,
++                                      PerfMonSample *sample)
+ {
+     map_modification_lock.readerIn();
+     bool map_lock = true;
+@@ -2674,6 +2745,11 @@ void ZmqEventConsumer::push_zmq_event(
+                 unsigned int cb_nb = ipos->second.callback_list.size();
+                 unsigned int cb_ctr = 0;
+ 
++                bool first_callback = true;
++                if(sample != nullptr)
++                {
++                    sample->callback_count = evt_cb.callback_list.size();
++                }
+                 for(esspos = evt_cb.callback_list.begin(); esspos != evt_cb.callback_list.end(); ++esspos)
+                 {
+                     if(missed_event_data != nullptr)
+@@ -2719,6 +2795,18 @@ void ZmqEventConsumer::push_zmq_event(
+                                                                       cb_nb,
+                                                                       cb_ctr,
+                                                                       callback);
++
++                            if(sample != nullptr && first_callback)
++                            {
++                                TimeVal reception_date = event_dat->reception_date;
++                                TimeVal send_date = event_dat->attr_value->get_date();
++
++                                sample->first_callback_lactency_micros =
++                                    (reception_date.tv_sec - send_date.tv_sec) * 1000000 +
++                                    (reception_date.tv_usec - send_date.tv_usec);
++
++                                first_callback = false;
++                            }
+                             //
+                             // If a callback method was specified, call it!
+                             //
+@@ -2877,6 +2965,7 @@ void ZmqEventConsumer::push_zmq_event(
+                                                            &dev_intr_change->atts,
+                                                            dev_intr_change->dev_started,
+                                                            errors);
++
+                             // if a callback method was specified, call it!
+                             if(callback != NULL)
+                             {
+diff --git a/src/include/tango/client/eventconsumer.h b/src/include/tango/client/eventconsumer.h
+index 85f1601e..c02f65be 100644
+--- a/src/include/tango/client/eventconsumer.h
++++ b/src/include/tango/client/eventconsumer.h
+@@ -45,6 +45,8 @@
+ 
+ #include <zmq.hpp>
+ 
++#include <tango/common/utils/perf_mon.h>
++
+ namespace Tango
+ {
+ 
+@@ -698,6 +700,34 @@ class ZmqEventConsumer : public EventConsumer, public omni_thread
+         }
+     }
+ 
++    struct PerfMonSample
++    {
++        long micros_since_last_event = -1;
++        long sleep_micros = 0;
++        long process_micros = 0;
++        long first_callback_lactency_micros = LONG_MIN;
++        int callback_count = 0;
++        int wake_count = 0;
++
++        void json_dump(std::ostream &os)
++        {
++            os << "{\"micros_since_last_event\":" << micros_since_last_event;
++            os << ",\"sleep_micros\":" << sleep_micros;
++            os << ",\"process_micros\":" << process_micros;
++            os << ",\"first_callback_lactency_micros\":" << first_callback_lactency_micros;
++            os << ",\"callback_count\":" << callback_count;
++            os << ",\"wake_count\":" << wake_count;
++            os << "}";
++        }
++    };
++
++    std::mutex perf_lock;
++    RingBuffer<PerfMonSample> perf_ring_buffer;
++    bool perf_mon_enabled = false;
++    PerfClock::time_point last_event_timestamp = {};
++
++    void start_perf_mon();
++    void stop_perf_mon();
+     void query_event_system(std::ostream &os);
+ 
+     virtual void cleanup_EventChannel_map() override;
+@@ -784,10 +814,11 @@ class ZmqEventConsumer : public EventConsumer, public omni_thread
+ 
+     void *run_undetached(void *arg) override;
+     void push_heartbeat_event(std::string &);
+-    void push_zmq_event(std::string &, unsigned char, zmq::message_t &, bool, const DevULong &);
++    void push_zmq_event(std::string &, unsigned char, zmq::message_t &, bool, const DevULong &, PerfMonSample *sample);
+     bool process_ctrl(zmq::message_t &, zmq::pollitem_t *, int &);
+     void process_heartbeat(zmq::message_t &, zmq::message_t &, zmq::message_t &);
+-    void process_event(zmq::message_t &, zmq::message_t &, zmq::message_t &, zmq::message_t &);
++    void process_event(
++        zmq::message_t &, zmq::message_t &, zmq::message_t &, zmq::message_t &, PerfMonSample *sample = nullptr);
+     void multi_tango_host(zmq::socket_t *, SocketCmd, const std::string &);
+ 
+     void print_error_message(const char *mess)
+diff --git a/src/include/tango/common/utils/perf_mon.h b/src/include/tango/common/utils/perf_mon.h
+new file mode 100644
+index 00000000..7839ba98
+--- /dev/null
++++ b/src/include/tango/common/utils/perf_mon.h
+@@ -0,0 +1,139 @@
++#ifndef TANGO_COMMON_UTILS_PERF_MON_H
++#define TANGO_COMMON_UTILS_PERF_MON_H
++
++#include <chrono>
++#include <ratio>
++
++namespace Tango
++{
++template <typename T>
++struct RingBuffer
++{
++    static constexpr const size_t size = 256;
++    T buffer[size];
++    size_t index = 0;
++    bool first_pass = true;
++
++    void reset()
++    {
++        index = 0;
++        first_pass = true;
++    }
++
++    void push(const T &v)
++    {
++        buffer[index] = v;
++        index = (index + 1) % size;
++        if(index == 0)
++        {
++            first_pass = false;
++        }
++    }
++
++    void json_dump(std::ostream &os)
++    {
++        os << "[";
++        bool first = true;
++        auto print_elem = [&first, &os, this](size_t i)
++        {
++            if(!first)
++            {
++                os << ",";
++            }
++
++            buffer[i].json_dump(os);
++
++            first = false;
++        };
++
++        if(!first_pass)
++        {
++            for(size_t i = index; i < size; ++i)
++            {
++                print_elem(i);
++            }
++        }
++
++        for(size_t i = 0; i < index; ++i)
++        {
++            print_elem(i);
++        }
++        os << "]";
++    }
++};
++
++using PerfClock = std::chrono::steady_clock;
++
++static_assert(std::ratio_less_equal<PerfClock::period, std::micro>::value, "not high enough resolution");
++
++inline long duration_micros(PerfClock::time_point start, PerfClock::time_point end)
++{
++    return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
++}
++
++template <typename T>
++struct SamplePusher
++{
++    SamplePusher(bool enabled, T &sample, RingBuffer<T> &buffer, std::mutex *mutex = nullptr) :
++        enabled(enabled),
++        sample(sample),
++        buffer(buffer),
++        mutex(mutex)
++    {
++    }
++
++    ~SamplePusher()
++    {
++        if(enabled)
++        {
++            if(mutex)
++            {
++                if(mutex->try_lock())
++                {
++                    buffer.push(sample);
++                    mutex->unlock();
++                }
++            }
++            else
++            {
++                buffer.push(sample);
++            }
++
++            sample = {};
++        }
++    }
++
++    bool enabled;
++    T &sample;
++    RingBuffer<T> &buffer;
++    std::mutex *mutex;
++};
++
++struct TimeBlockMicros
++{
++    TimeBlockMicros(bool enabled, long *slot) :
++        enabled(enabled),
++        slot(slot)
++    {
++        if(enabled)
++        {
++            start = PerfClock::now();
++        }
++    }
++
++    ~TimeBlockMicros()
++    {
++        if(enabled)
++        {
++            PerfClock::time_point end = PerfClock::now();
++            *slot += duration_micros(start, end);
++        }
++    }
++
++    bool enabled;
++    PerfClock::time_point start;
++    long *slot;
++};
++} // namespace Tango
++
++#endif
+diff --git a/src/include/tango/server/dserver.h b/src/include/tango/server/dserver.h
+index 29b91296..3ad1a859 100644
+--- a/src/include/tango/server/dserver.h
++++ b/src/include/tango/server/dserver.h
+@@ -72,6 +72,8 @@ class DServer : public TANGO_BASE_CLASS
+     Tango::DevVarStringArray *query_class();
+     Tango::DevVarStringArray *query_device();
+     Tango::DevVarStringArray *query_sub_device();
++    void start_event_system_perf_mon();
++    void stop_event_system_perf_mon();
+     Tango::DevString query_event_system();
+     void kill();
+     void restart(const std::string &);
+diff --git a/src/include/tango/server/dserverclass.h b/src/include/tango/server/dserverclass.h
+index 46d4d247..d4727f6e 100644
+--- a/src/include/tango/server/dserverclass.h
++++ b/src/include/tango/server/dserverclass.h
+@@ -151,6 +151,32 @@ class DevQuerySubDeviceCmd : public Command
+     virtual CORBA::Any *execute(DeviceImpl *device, const CORBA::Any &in_any);
+ };
+ 
++class DevStartEventSystemPerfMonCmd : public Command
++{
++  public:
++    DevStartEventSystemPerfMonCmd(const char *cmd_name,
++                                  Tango::CmdArgType argin,
++                                  Tango::CmdArgType argout,
++                                  const char *desc);
++
++    ~DevStartEventSystemPerfMonCmd() override = default;
++
++    CORBA::Any *execute(DeviceImpl *device, const CORBA::Any &in_any) override;
++};
++
++class DevStopEventSystemPerfMonCmd : public Command
++{
++  public:
++    DevStopEventSystemPerfMonCmd(const char *cmd_name,
++                                 Tango::CmdArgType argin,
++                                 Tango::CmdArgType argout,
++                                 const char *desc);
++
++    ~DevStopEventSystemPerfMonCmd() override = default;
++
++    CORBA::Any *execute(DeviceImpl *device, const CORBA::Any &in_any) override;
++};
++
+ class DevQueryEventSystemCmd : public Command
+ {
+   public:
+diff --git a/src/include/tango/server/eventsupplier.h b/src/include/tango/server/eventsupplier.h
+index a22f9f86..277aaffd 100644
+--- a/src/include/tango/server/eventsupplier.h
++++ b/src/include/tango/server/eventsupplier.h
+@@ -68,6 +68,8 @@
+ 
+ #include <chrono>
+ 
++#include <tango/common/utils/perf_mon.h>
++
+ namespace Tango
+ {
+ 
+@@ -309,12 +311,32 @@ class NotifdEventSupplier : public EventSupplier, public POA_CosNotifyComm::Stru
+ #define LARGE_DATA_THRESHOLD_ENCODED LARGE_DATA_THRESHOLD * 4
+ 
+ class ZmqEventSupplier : public EventSupplier
++
+ {
+   public:
+     static ZmqEventSupplier *create(Util *);
+     virtual ~ZmqEventSupplier();
+ 
++    struct PerfMonSample
++    {
++        long micros_since_last_event = -1; // -1 means no last event;
++        long push_event_micros = 0;
++
++        void json_dump(std::ostream &os)
++        {
++            os << "{\"micros_since_last_event\":" << micros_since_last_event;
++            os << ",\"push_event_micros\":" << push_event_micros;
++            os << "}";
++        }
++    };
++
++    RingBuffer<PerfMonSample> perf_ring_buffer;
++    bool perf_mon_enabled = false;
++    PerfClock::time_point last_event_timestamp = {};
++
+     void query_event_system(std::ostream &os);
++    void start_perf_mon();
++    void stop_perf_mon();
+ 
+     //------------------ Push event -------------------------------
+ 
+diff --git a/src/server/dserver.cpp b/src/server/dserver.cpp
+index 0f42d8c4..e7ffbc82 100644
+--- a/src/server/dserver.cpp
++++ b/src/server/dserver.cpp
+@@ -711,6 +711,40 @@ Tango::DevVarStringArray *DServer::query_sub_device()
+     return (ret);
+ }
+ 
++void DServer::start_event_system_perf_mon()
++{
++    Tango::Util *tg = Tango::Util::instance();
++    auto *supplier = tg->get_zmq_event_supplier();
++    if(supplier != nullptr)
++    {
++        supplier->start_perf_mon();
++    }
++
++    Tango::ApiUtil *api = Tango::ApiUtil::instance();
++    auto *consumer = api->get_zmq_event_consumer();
++    if(consumer != nullptr)
++    {
++        consumer->start_perf_mon();
++    }
++}
++
++void DServer::stop_event_system_perf_mon()
++{
++    Tango::Util *tg = Tango::Util::instance();
++    auto *supplier = tg->get_zmq_event_supplier();
++    if(supplier != nullptr)
++    {
++        supplier->stop_perf_mon();
++    }
++
++    Tango::ApiUtil *api = Tango::ApiUtil::instance();
++    auto *consumer = api->get_zmq_event_consumer();
++    if(consumer != nullptr)
++    {
++        consumer->stop_perf_mon();
++    }
++}
++
+ Tango::DevString DServer::query_event_system()
+ {
+     NoSyncModelTangoMonitor mon(this);
+@@ -718,17 +752,27 @@ Tango::DevString DServer::query_event_system()
+     TANGO_LOG_DEBUG << "In query_event_system command" << std::endl;
+ 
+     std::stringstream out;
+-    out << "{\"server\":";
+ 
++    out << "{";
+     Tango::Util *tg = Tango::Util::instance();
+     auto *supplier = tg->get_zmq_event_supplier();
+-    supplier->query_event_system(out);
+-
+-    out << ",{\"client\":";
++    if(supplier != nullptr)
++    {
++        out << "\"server\":";
++        supplier->query_event_system(out);
++    }
+ 
+     Tango::ApiUtil *api = Tango::ApiUtil::instance();
+     auto *consumer = api->get_zmq_event_consumer();
+-    consumer->query_event_system(out);
++    if(consumer != nullptr)
++    {
++        if(supplier != nullptr)
++        {
++            out << ",";
++        }
++        out << "\"client\":";
++        consumer->query_event_system(out);
++    }
+ 
+     out << "}";
+ 
+diff --git a/src/server/dserverclass.cpp b/src/server/dserverclass.cpp
+index 4b785b49..90176b26 100644
+--- a/src/server/dserverclass.cpp
++++ b/src/server/dserverclass.cpp
+@@ -312,6 +312,40 @@ CORBA::Any *DevQuerySubDeviceCmd::execute(DeviceImpl *device, TANGO_UNUSED(const
+     return (out_any);
+ }
+ 
++DevStartEventSystemPerfMonCmd::DevStartEventSystemPerfMonCmd(const char *name,
++                                                             Tango::CmdArgType argin,
++                                                             Tango::CmdArgType argout,
++                                                             const char *out_desc) :
++    Command(name, argin, argout)
++{
++    set_out_type_desc(out_desc);
++}
++
++CORBA::Any *DevStartEventSystemPerfMonCmd::execute(DeviceImpl *device, TANGO_UNUSED(const CORBA::Any &in_any))
++{
++    (static_cast<DServer *>(device))->start_event_system_perf_mon();
++
++    CORBA::Any *ret = return_empty_any("DevStartEventSystemPerfMonCmd");
++    return ret;
++}
++
++DevStopEventSystemPerfMonCmd::DevStopEventSystemPerfMonCmd(const char *name,
++                                                           Tango::CmdArgType argin,
++                                                           Tango::CmdArgType argout,
++                                                           const char *out_desc) :
++    Command(name, argin, argout)
++{
++    set_out_type_desc(out_desc);
++}
++
++CORBA::Any *DevStopEventSystemPerfMonCmd::execute(DeviceImpl *device, TANGO_UNUSED(const CORBA::Any &in_any))
++{
++    (static_cast<DServer *>(device))->stop_event_system_perf_mon();
++
++    CORBA::Any *ret = return_empty_any("DevStopEventSystemPerfMonCmd");
++    return ret;
++}
++
+ DevQueryEventSystemCmd::DevQueryEventSystemCmd(const char *name,
+                                                Tango::CmdArgType argin,
+                                                Tango::CmdArgType argout,
+@@ -1431,6 +1465,10 @@ void DServerClass::command_factory()
+         "QueryDevice", Tango::DEV_VOID, Tango::DEVVAR_STRINGARRAY, "Device server device(s) list"));
+     command_list.push_back(new DevQuerySubDeviceCmd(
+         "QuerySubDevice", Tango::DEV_VOID, Tango::DEVVAR_STRINGARRAY, "Device server sub device(s) list"));
++    command_list.push_back(new DevStartEventSystemPerfMonCmd(
++        "StartEventSystemPerfMon", Tango::DEV_VOID, Tango::DEV_VOID, "Start perfomance monitoring the event system"));
++    command_list.push_back(new DevStopEventSystemPerfMonCmd(
++        "StopEventSystemPerfMon", Tango::DEV_VOID, Tango::DEV_VOID, "Stop performance monitoring the event system"));
+     command_list.push_back(new DevQueryEventSystemCmd(
+         "QueryEventSystem", Tango::DEV_VOID, Tango::DEV_STRING, "Information about the event system"));
+     command_list.push_back(new DevKillCmd("Kill", Tango::DEV_VOID, Tango::DEV_VOID));
+diff --git a/src/server/zmqeventsupplier.cpp b/src/server/zmqeventsupplier.cpp
+index 642bbfe6..18bea88a 100644
+--- a/src/server/zmqeventsupplier.cpp
++++ b/src/server/zmqeventsupplier.cpp
+@@ -819,20 +819,43 @@ void ZmqEventSupplier::init_event_cptr(const std::string &event_name)
+     }
+ }
+ 
++void ZmqEventSupplier::start_perf_mon()
++{
++    perf_mon_enabled = true;
++    last_event_timestamp = {};
++    perf_ring_buffer.reset();
++}
++
++void ZmqEventSupplier::stop_perf_mon()
++{
++    perf_mon_enabled = false;
++}
++
+ void ZmqEventSupplier::query_event_system(std::ostream &os)
+ {
+     os << "{\"event_counters\":{";
+-    bool first = true;
+-    for(const auto &pair : event_cptr)
+     {
+-        if(!first)
++        bool first = true;
++        for(const auto &pair : event_cptr)
+         {
+-            os << ",";
++            if(!first)
++            {
++                os << ",";
++            }
++            os << "\"" << pair.first << "\":" << pair.second;
++            first = false;
+         }
+-        os << "\"" << pair.first << "\":" << pair.second;
+-        first = false;
+     }
+-    os << "}}";
++    os << "},\"perf_stats\":";
++    if(perf_mon_enabled)
++    {
++        perf_ring_buffer.json_dump(os);
++    }
++    else
++    {
++        os << "null";
++    }
++    os << "}";
+ }
+ 
+ //+-------------------------------------------------------------------------------------------------------------------
+@@ -1052,6 +1075,18 @@ void ZmqEventSupplier::push_event(DeviceImpl *device_impl,
+                                   DevFailed *except,
+                                   bool inc_cptr)
+ {
++    PerfMonSample sample;
++    SamplePusher<PerfMonSample> pusher{perf_mon_enabled, sample, perf_ring_buffer};
++    TimeBlockMicros perf_mon{perf_mon_enabled, &sample.push_event_micros};
++    if(perf_mon_enabled)
++    {
++        if(last_event_timestamp != PerfClock::time_point{})
++        {
++            sample.micros_since_last_event = duration_micros(last_event_timestamp, perf_mon.start);
++        }
++        last_event_timestamp = perf_mon.start;
++    }
++
+     if(device_impl == NULL)
+     {
+         return;
+-- 
+2.48.1
+

@@ -1,0 +1,247 @@
+From 8715d2d2af359a764dd9188ccf12465271c58116 Mon Sep 17 00:00:00 2001
+From: Thomas Ives <tri@observatorysciences.co.uk>
+Date: Tue, 11 Feb 2025 22:14:54 +0000
+Subject: [PATCH 1/3] Add QueryEventSystem DServer command
+
+---
+ src/client/zmqeventconsumer.cpp          | 38 ++++++++++++++++++++++++
+ src/include/tango/client/eventconsumer.h |  6 ++--
+ src/include/tango/server/dserver.h       |  1 +
+ src/include/tango/server/dserverclass.h  | 10 +++++++
+ src/include/tango/server/eventsupplier.h |  2 ++
+ src/server/dserver.cpp                   | 26 ++++++++++++++++
+ src/server/dserverclass.cpp              | 21 +++++++++++++
+ src/server/zmqeventsupplier.cpp          | 16 ++++++++++
+ 8 files changed, 118 insertions(+), 2 deletions(-)
+
+diff --git a/src/client/zmqeventconsumer.cpp b/src/client/zmqeventconsumer.cpp
+index fc307156..e8def231 100644
+--- a/src/client/zmqeventconsumer.cpp
++++ b/src/client/zmqeventconsumer.cpp
+@@ -1087,6 +1087,44 @@ void ZmqEventConsumer::multi_tango_host(zmq::socket_t *sock, SocketCmd cmd, cons
+     }
+ }
+ 
++void ZmqEventConsumer::query_event_system(std::ostream &os)
++{
++    os << "{\"event_callbacks\":{";
++    {
++        bool first = true;
++        for(const auto &pair : event_callback_map)
++        {
++            if(!first)
++            {
++                os << ",";
++            }
++            os << "\"" << pair.first << "\":{";
++            os << "\"channel_name\":\"" << pair.second.channel_name << "\"";
++            os << ",\"callback_count\":" << pair.second.callback_list.size();
++            os << ",\"counter\":" << pair.second.ctr;
++            char buffer[128];
++            std::strftime(buffer, 128, "%Y-%m-%dT%H:%M:%S", std::gmtime(&pair.second.last_subscribed));
++            os << ",\"last_subscribed\":\"" << (const char *) buffer << "\"";
++            first = false;
++        }
++    }
++    os << "},\"event_channels\":{";
++    {
++        bool first = true;
++        for(const auto &pair : channel_map)
++        {
++            if(!first)
++            {
++                os << ",";
++            }
++            os << "\"" << pair.first << "\":{";
++            os << "\"endpoint\":\"" << pair.second.endpoint << "\"";
++            first = false;
++        }
++    }
++    os << "}}";
++}
++
+ //--------------------------------------------------------------------------------------------------------------------
+ //
+ // method :
+diff --git a/src/include/tango/client/eventconsumer.h b/src/include/tango/client/eventconsumer.h
+index 50adbe2f..85f1601e 100644
+--- a/src/include/tango/client/eventconsumer.h
++++ b/src/include/tango/client/eventconsumer.h
+@@ -215,14 +215,14 @@ struct ZmqDevPipeDataElt : public DevPipeDataElt
+ /***    Macros to help coding       ***/
+ 
+ #ifndef Swap16
+-  #define Swap16(s) ((((s) &0xff) << 8) | (((s) >> 8) & 0xff))
++  #define Swap16(s) ((((s) & 0xff) << 8) | (((s) >> 8) & 0xff))
+ #else
+   #error "Swap16 has already been defined"
+ #endif
+ 
+ #ifndef Swap32
+   #define Swap32(l) \
+-      ((((l) &0xff000000) >> 24) | (((l) &0x00ff0000) >> 8) | (((l) &0x0000ff00) << 8) | (((l) &0x000000ff) << 24))
++      ((((l) & 0xff000000) >> 24) | (((l) & 0x00ff0000) >> 8) | (((l) & 0x0000ff00) << 8) | (((l) & 0x000000ff) << 24))
+ #else
+   #error "Swap32 has already been defined"
+ #endif
+@@ -698,6 +698,8 @@ class ZmqEventConsumer : public EventConsumer, public omni_thread
+         }
+     }
+ 
++    void query_event_system(std::ostream &os);
++
+     virtual void cleanup_EventChannel_map() override;
+ 
+     virtual void get_subscription_command_name(std::string &cmd) override
+diff --git a/src/include/tango/server/dserver.h b/src/include/tango/server/dserver.h
+index d48b85f6..29b91296 100644
+--- a/src/include/tango/server/dserver.h
++++ b/src/include/tango/server/dserver.h
+@@ -72,6 +72,7 @@ class DServer : public TANGO_BASE_CLASS
+     Tango::DevVarStringArray *query_class();
+     Tango::DevVarStringArray *query_device();
+     Tango::DevVarStringArray *query_sub_device();
++    Tango::DevString query_event_system();
+     void kill();
+     void restart(const std::string &);
+     void restart_server();
+diff --git a/src/include/tango/server/dserverclass.h b/src/include/tango/server/dserverclass.h
+index 383816a5..46d4d247 100644
+--- a/src/include/tango/server/dserverclass.h
++++ b/src/include/tango/server/dserverclass.h
+@@ -151,6 +151,16 @@ class DevQuerySubDeviceCmd : public Command
+     virtual CORBA::Any *execute(DeviceImpl *device, const CORBA::Any &in_any);
+ };
+ 
++class DevQueryEventSystemCmd : public Command
++{
++  public:
++    DevQueryEventSystemCmd(const char *cmd_name, Tango::CmdArgType argin, Tango::CmdArgType argout, const char *desc);
++
++    ~DevQueryEventSystemCmd() override = default;
++
++    CORBA::Any *execute(DeviceImpl *device, const CORBA::Any &in_any) override;
++};
++
+ //=============================================================================
+ //
+ //            The DevKillCmd class
+diff --git a/src/include/tango/server/eventsupplier.h b/src/include/tango/server/eventsupplier.h
+index 0ea20311..a22f9f86 100644
+--- a/src/include/tango/server/eventsupplier.h
++++ b/src/include/tango/server/eventsupplier.h
+@@ -314,6 +314,8 @@ class ZmqEventSupplier : public EventSupplier
+     static ZmqEventSupplier *create(Util *);
+     virtual ~ZmqEventSupplier();
+ 
++    void query_event_system(std::ostream &os);
++
+     //------------------ Push event -------------------------------
+ 
+     void push_heartbeat_event();
+diff --git a/src/server/dserver.cpp b/src/server/dserver.cpp
+index 414c8387..0f42d8c4 100644
+--- a/src/server/dserver.cpp
++++ b/src/server/dserver.cpp
+@@ -711,6 +711,32 @@ Tango::DevVarStringArray *DServer::query_sub_device()
+     return (ret);
+ }
+ 
++Tango::DevString DServer::query_event_system()
++{
++    NoSyncModelTangoMonitor mon(this);
++
++    TANGO_LOG_DEBUG << "In query_event_system command" << std::endl;
++
++    std::stringstream out;
++    out << "{\"server\":";
++
++    Tango::Util *tg = Tango::Util::instance();
++    auto *supplier = tg->get_zmq_event_supplier();
++    supplier->query_event_system(out);
++
++    out << ",{\"client\":";
++
++    Tango::ApiUtil *api = Tango::ApiUtil::instance();
++    auto *consumer = api->get_zmq_event_consumer();
++    consumer->query_event_system(out);
++
++    out << "}";
++
++    Tango::DevString ret = string_dup(out.str());
++
++    return ret;
++}
++
+ //+-----------------------------------------------------------------------------------------------------------------
+ //
+ // method :
+diff --git a/src/server/dserverclass.cpp b/src/server/dserverclass.cpp
+index 9227a259..4b785b49 100644
+--- a/src/server/dserverclass.cpp
++++ b/src/server/dserverclass.cpp
+@@ -312,6 +312,25 @@ CORBA::Any *DevQuerySubDeviceCmd::execute(DeviceImpl *device, TANGO_UNUSED(const
+     return (out_any);
+ }
+ 
++DevQueryEventSystemCmd::DevQueryEventSystemCmd(const char *name,
++                                               Tango::CmdArgType argin,
++                                               Tango::CmdArgType argout,
++                                               const char *out_desc) :
++    Command(name, argin, argout)
++{
++    set_out_type_desc(out_desc);
++}
++
++CORBA::Any *DevQueryEventSystemCmd::execute(DeviceImpl *device, TANGO_UNUSED(const CORBA::Any &in_any))
++{
++    auto *out_any = new CORBA::Any();
++
++    Tango::DevString ret = (static_cast<DServer *>(device))->query_event_system();
++    (*out_any) <<= ret;
++
++    return out_any;
++}
++
+ //+----------------------------------------------------------------------------
+ //
+ // method :         DevKillCmd::DevKillCmd()
+@@ -1412,6 +1431,8 @@ void DServerClass::command_factory()
+         "QueryDevice", Tango::DEV_VOID, Tango::DEVVAR_STRINGARRAY, "Device server device(s) list"));
+     command_list.push_back(new DevQuerySubDeviceCmd(
+         "QuerySubDevice", Tango::DEV_VOID, Tango::DEVVAR_STRINGARRAY, "Device server sub device(s) list"));
++    command_list.push_back(new DevQueryEventSystemCmd(
++        "QueryEventSystem", Tango::DEV_VOID, Tango::DEV_STRING, "Information about the event system"));
+     command_list.push_back(new DevKillCmd("Kill", Tango::DEV_VOID, Tango::DEV_VOID));
+ 
+     //
+diff --git a/src/server/zmqeventsupplier.cpp b/src/server/zmqeventsupplier.cpp
+index 69cbfb0b..642bbfe6 100644
+--- a/src/server/zmqeventsupplier.cpp
++++ b/src/server/zmqeventsupplier.cpp
+@@ -819,6 +819,22 @@ void ZmqEventSupplier::init_event_cptr(const std::string &event_name)
+     }
+ }
+ 
++void ZmqEventSupplier::query_event_system(std::ostream &os)
++{
++    os << "{\"event_counters\":{";
++    bool first = true;
++    for(const auto &pair : event_cptr)
++    {
++        if(!first)
++        {
++            os << ",";
++        }
++        os << "\"" << pair.first << "\":" << pair.second;
++        first = false;
++    }
++    os << "}}";
++}
++
+ //+-------------------------------------------------------------------------------------------------------------------
+ //
+ // method :
+-- 
+2.48.1
+
