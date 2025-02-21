@@ -1,18 +1,20 @@
-from tango import DeviceProxy, DevFailed, Group
+import itertools
+import json
+import re
+import statistics
+import sys
+import time
 from argparse import ArgumentParser
 from datetime import datetime
-import re
-import json
-import statistics
-import itertools
-import time
+
+from tango import DevFailed, DeviceProxy, Group
 
 # TODO: split this up.
 
 def build_parser() -> ArgumentParser:
     parser = ArgumentParser(
-        prog="ska-tango-event-moniotor",
-        description="Called QueryEventSystem periodically and summarizes the output",
+        prog="ska-tango-event-monitor",
+        description="Calls QueryEventSystem periodically and summarizes the output",
     )
     parser.add_argument('device', help='device or admin device to poll', nargs='+')
     parser.add_argument('--poll-period', help='period between polls in seconds', type=float, default=10.0)
