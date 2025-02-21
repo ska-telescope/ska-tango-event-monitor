@@ -55,3 +55,41 @@ included in the next call to QueryEventSystem.  Only the most recent 256 samples
 ### StopEventSystemPerfMon
 
 Stops the recording of performance samples.
+
+## Building
+
+To build the patched wheel run the following:
+
+```
+make build_pytango950
+```
+
+## Local testing
+
+After running building the patched wheel, a test OCI image can be built by
+running:
+
+```
+./tests/build.sh
+```
+
+These can then be deployed with:
+
+```sh
+docker compose -f tests/compose.yaml up -d
+export TANGO_HOST=localhost:10000
+```
+
+This provides a Tango database on `locahost:10000` and two devices
+`foo/bar/pub` and `foo/bar/sub`.  `foo/bar/sub` can be made to start
+subscriptions to `foo/bar/pub` by invoking the `StartSubscriptions` command:
+
+```sh
+python -c "import tango; tango.DeviceProxy("foo/bar/sub").StartSubscription()"
+```
+
+The devices can then both be monitored with:
+
+```sh
+ska-tango-event-monitor "foo/bar/pub" "foo/bar/sub"
+```

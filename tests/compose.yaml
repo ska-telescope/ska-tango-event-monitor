@@ -1,0 +1,113 @@
+networks:
+  tango-net:
+    name: tango-net
+    driver: bridge
+
+services:
+  tango-db:
+    image: artefact.skao.int/ska-tango-images-tango-db:11.0.3
+    platform: linux/x86_64
+    networks:
+      - tango-net
+    environment:
+      - MARIADB_ROOT_PASSWORD=root
+      - MARIADB_DATABASE=tango
+      - MARIADB_USER=tango
+      - MARIADB_PASSWORD=tango
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect"]
+      start_period: 10s
+      interval: 500ms
+      timeout: 1s
+      retries: 3
+
+  tango-dbds:
+    image: artefact.skao.int/ska-tango-images-tango-databaseds:5.22.2
+    platform: linux/x86_64
+    networks:
+      - tango-net
+    ports:
+      - "10000:10000"
+    environment:
+      - TANGO_HOST=localhost:10000
+      - MYSQL_HOST=tango-db:3306
+      - MYSQL_USER=tango
+      - MYSQL_PASSWORD=tango
+      - MYSQL_DATABASE=tango
+    depends_on:
+      tango-db:
+        condition: service_healthy
+    entrypoint: Databaseds
+    command:
+      - "2"
+      - -ORBendPoint
+      - giop:tcp::10000
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/tango_admin", "--ping-database"]
+      start_period: 10s
+      start_interval: 500ms
+      timeout: 1s
+      retries: 3
+
+  load-tango-config:
+    image: artefact.skao.int/ska-tango-images-tango-admin:1.17.1
+    platform: linux/x86_64
+    networks:
+      - tango-net
+    environment:
+      - TANGO_HOST=tango-dbds:10000
+    depends_on:
+      tango-dbds:
+        condition: service_healthy
+    entrypoint: 
+     - "bash"
+    command:
+     - "-c"
+     - "tango_admin --add-server MyServer/1 PubDevice foo/bar/pub && tango_admin --add-server MyServer/2 SubDevice foo/bar/sub"
+
+  test-pub:
+    image: ska-tango-event-monitor-test
+    platform: linux/x86_64
+    networks:
+      - tango-net
+    environment:
+      - TANGO_HOST=tango-dbds:10000
+    depends_on:
+      tango-dbds:
+        condition: service_healthy
+      load-tango-config:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/tango_admin", "--ping-device", "foo/bar/pub"]
+      start_period: 10s
+      interval: 500ms
+      timeout: 1s
+      retries: 3
+    command:
+      - MyServer
+      - "1"
+
+  test-sub:
+    image: ska-tango-event-monitor-test
+    platform: linux/x86_64
+    networks:
+      - tango-net
+    environment:
+      - TANGO_HOST=tango-dbds:10000
+      - ORBtraceLevel=25
+    depends_on:
+      tango-dbds:
+        condition: service_healthy
+      test-pub:
+        condition: service_healthy
+      load-tango-config:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/tango_admin", "--ping-device", "foo/bar/sub"]
+      start_period: 10s
+      interval: 500ms
+      timeout: 1s
+      retries: 3
+    command:
+      - MyServer
+      - "2"
