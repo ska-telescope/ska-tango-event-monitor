@@ -20,6 +20,7 @@ def build_parser() -> ArgumentParser:
     parser.add_argument('--poll-period', help='period between polls in seconds', type=float, default=10.0)
     parser.add_argument('-o', '--output', help='file to save data to, one json object per line', default=None)
     parser.add_argument('-a', '--append', help='append to file', action='store_true')
+    parser.add_argument('-m', '--monitor-perf', help='enable performance monitoring', action='store_true')
 
     return parser
 
@@ -182,52 +183,59 @@ def main():
     if args.output is not None:
         output = open(args.output, mode)
 
-    while(True):
-        next_poll = time.time() + args.poll_period
+    try:
+        if args.monitor_perf:
+            group.command_inout("StartEventSystemPerfMon")
 
-        try:
-            now = datetime.now().isoformat()
-            replies = group.command_inout("QueryEventSystem")
+        while(True):
+            next_poll = time.time() + args.poll_period
 
-            line = ''
-            if output is not None:
-                line += f'{{"time":"{now}", "replies":{{'
+            try:
+                now = datetime.now().isoformat()
+                replies = group.command_inout("QueryEventSystem")
 
-            print(f"*** {now}")
-            first = True
-            for reply in replies:
-                name = reply.dev_name()
+                line = ''
                 if output is not None:
-                    if not first:
-                        line += ','
-                    line += f'"{name}":'
-                    first=False
-                if reply.has_failed():
-                    errs = reply.get_err_stack()
-                    print(errs, file=sys.stderr)
+                    line += f'{{"time":"{now}", "replies":{{'
+
+                print(f"*** {now}")
+                first = True
+                for reply in replies:
+                    name = reply.dev_name()
                     if output is not None:
-                        line += f'{{"error":"{repr(errs)}"}}'
-                else:
-                    s = reply.get_data()
+                        if not first:
+                            line += ','
+                        line += f'"{name}":'
+                        first=False
+                    if reply.has_failed():
+                        errs = reply.get_err_stack()
+                        print(f"{display_names[name]}: {errs}")
+                        if output is not None:
+                            line += f'{{"error":"{repr(errs)}"}}'
+                    else:
+                        s = reply.get_data()
 
-                    if output is not None:
-                        line += f'{{"data":{s}}}'
+                        if output is not None:
+                            line += f'{{"data":{s}}}'
 
-                    data = json.loads(s)
-                    print_summary(display_names[name], data, last_data[name])
-                    last_data[name] = data
+                        data = json.loads(s)
+                        print_summary(display_names[name], data, last_data[name])
+                        last_data[name] = data
 
-            if output is not None:
-                output.write(f'{line}\n')
-            print(f"\n\n")
-        except DevFailed as exc:
-            print(exc, file=sys.stderr)
+                if output is not None:
+                    output.write(f'{line}\n')
+                print(f"\n\n")
+            except DevFailed as exc:
+                print(exc, file=sys.stderr)
 
-        sleep_for = next_poll - time.time()
-        if sleep_for > 0.001:
-            time.sleep(sleep_for)
-        elif sleep_for < 0:
-            print(f'poll time missed by {-sleep_for}s', file=sys.stderr)
+            sleep_for = next_poll - time.time()
+            if sleep_for > 0.001:
+                time.sleep(sleep_for)
+            elif sleep_for < 0:
+                print(f'poll time missed by {-sleep_for}s', file=sys.stderr)
+    finally:
+        if args.monitor_perf:
+            group.command_inout("StopEventSystemPerfMon")
 
 
 if __name__ == '__main__':

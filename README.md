@@ -33,6 +33,7 @@ ska-tango-event-monitor <device> [<device>...] [options]
 - `--poll-period`: Period between polls in seconds (default: 10.0).
 - `-o, --output`: File to save data to, one JSON object per line (default: None).
 - `-a, --append`: Append to file (default: False).
+- '-m', '--monitor-perf': Enable performance monitoring
 
 ### Example
 
@@ -97,5 +98,5 @@ python -c "import tango; tango.DeviceProxy("foo/bar/sub").StartSubscription()"
 The devices can then both be monitored with:
 
 ```sh
-ska-tango-event-monitor "foo/bar/pub" "foo/bar/sub"
+ska-tango-event-monitor -m "foo/bar/pub" "foo/bar/sub"
 ```
