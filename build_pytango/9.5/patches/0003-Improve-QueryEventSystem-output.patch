@@ -1,7 +1,7 @@
 From c8ada637af8b372b0d83dcf6b0106411c2bd6725 Mon Sep 17 00:00:00 2001
 From: Thomas Ives <tri@observatorysciences.co.uk>
 Date: Mon, 17 Feb 2025 13:13:57 +0000
-Subject: [PATCH 3/3] Improve QueryEventSystem output
+Subject: [PATCH 3/4] Improve QueryEventSystem output
 
 ---
  src/client/zmqeventconsumer.cpp          | 20 +++++++-

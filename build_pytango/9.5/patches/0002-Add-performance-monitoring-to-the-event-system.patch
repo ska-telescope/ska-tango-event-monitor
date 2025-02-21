@@ -1,7 +1,7 @@
 From df5bbd370d86f9cb70ded9f607e101d3af0ec5ee Mon Sep 17 00:00:00 2001
 From: Thomas Ives <tri@observatorysciences.co.uk>
 Date: Wed, 12 Feb 2025 10:33:20 +0000
-Subject: [PATCH 2/3] Add performance monitoring to the event system
+Subject: [PATCH 2/4] Add performance monitoring to the event system
 
 ---
  CMakeLists.txt                            |   2 +-

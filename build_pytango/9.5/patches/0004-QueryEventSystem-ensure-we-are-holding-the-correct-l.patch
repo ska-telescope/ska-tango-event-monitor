@@ -1,0 +1,281 @@
+From d78819a33a1b829f18d0d0d13a6af5e06c476cf2 Mon Sep 17 00:00:00 2001
+From: Thomas Ives <tri@observatorysciences.co.uk>
+Date: Fri, 21 Feb 2025 15:52:24 +0000
+Subject: [PATCH 4/4] QueryEventSystem ensure we are holding the correct locks
+
+---
+ src/client/zmqeventconsumer.cpp           | 68 +++++++++++++----------
+ src/include/tango/common/utils/perf_mon.h | 29 ++++++++++
+ src/include/tango/server/eventsupplier.h  |  1 +
+ src/server/zmqeventsupplier.cpp           | 60 +++++++++++++++-----
+ 4 files changed, 113 insertions(+), 45 deletions(-)
+
+diff --git a/src/client/zmqeventconsumer.cpp b/src/client/zmqeventconsumer.cpp
+index b1fba735..cc163b00 100644
+--- a/src/client/zmqeventconsumer.cpp
++++ b/src/client/zmqeventconsumer.cpp
+@@ -1140,52 +1140,60 @@ void ZmqEventConsumer::stop_perf_mon()
+ 
+ void ZmqEventConsumer::query_event_system(std::ostream &os)
+ {
+-    os << "{\"event_callbacks\":{";
+     {
+-        bool first = true;
+-        for(const auto &pair : event_callback_map)
++        ReaderLock l(map_modification_lock);
++        os << "{\"event_callbacks\":{";
+         {
+-            if(!first)
++            bool first = true;
++            for(const auto &pair : event_callback_map)
+             {
+-                os << ",";
++                if(!first)
++                {
++                    os << ",";
++                }
++                os << "\"" << pair.first << "\":{";
++                os << "\"channel_name\":\"" << pair.second.channel_name << "\"";
++                os << ",\"callback_count\":" << pair.second.callback_list.size();
++                os << ",\"server_counter\":" << pair.second.ctr;
++                os << ",\"event_count\":" << pair.second.event_count;
++                os << ",\"missed_event_count\":" << pair.second.missed_event_count;
++                char buffer[128];
++                std::strftime(buffer, 128, "%Y-%m-%dT%H:%M:%S", std::gmtime(&pair.second.last_subscribed));
++                os << ",\"last_resubscribed\":\"" << (const char *) buffer << "\"";
++                os << "}";
++                first = false;
+             }
+-            os << "\"" << pair.first << "\":{";
+-            os << "\"channel_name\":\"" << pair.second.channel_name << "\"";
+-            os << ",\"callback_count\":" << pair.second.callback_list.size();
+-            os << ",\"server_counter\":" << pair.second.ctr;
+-            os << ",\"event_count\":" << pair.second.event_count;
+-            os << ",\"missed_event_count\":" << pair.second.missed_event_count;
+-            char buffer[128];
+-            std::strftime(buffer, 128, "%Y-%m-%dT%H:%M:%S", std::gmtime(&pair.second.last_subscribed));
+-            os << ",\"last_resubscribed\":\"" << (const char *) buffer << "\"";
+-            os << "}";
+-            first = false;
+         }
+-    }
+-    os << "},\"event_channels\":{";
+-    {
+-        bool first = true;
+-        for(const auto &pair : channel_map)
++        os << "},\"event_channels\":{";
+         {
+-            if(!first)
++            bool first = true;
++            for(const auto &pair : channel_map)
+             {
+-                os << ",";
++                if(!first)
++                {
++                    os << ",";
++                }
++                os << "\"" << pair.first << "\":{";
++                os << "\"endpoint\":\"" << pair.second.endpoint << "\"";
++                os << "}";
++                first = false;
+             }
+-            os << "\"" << pair.first << "\":{";
+-            os << "\"endpoint\":\"" << pair.second.endpoint << "\"";
+-            os << "}";
+-            first = false;
+         }
+     }
+     os << "},\"perf_stats\":";
+-    if(perf_mon_enabled)
++    bool enabled = false;
++    RingBuffer<PerfMonSample> buffer;
+     {
+-        RingBuffer<PerfMonSample> buffer;
++        std::lock_guard<std::mutex> lg{perf_lock};
++        if(perf_mon_enabled)
+         {
+-            std::lock_guard<std::mutex> lg{perf_lock};
+             buffer = perf_ring_buffer;
+             perf_ring_buffer.reset();
++            enabled = true;
+         }
++    }
++    if(enabled)
++    {
+         buffer.json_dump(os);
+     }
+     else
+diff --git a/src/include/tango/common/utils/perf_mon.h b/src/include/tango/common/utils/perf_mon.h
+index 7839ba98..cdc11c6d 100644
+--- a/src/include/tango/common/utils/perf_mon.h
++++ b/src/include/tango/common/utils/perf_mon.h
+@@ -111,6 +111,11 @@ struct SamplePusher
+ 
+ struct TimeBlockMicros
+ {
++    TimeBlockMicros() :
++        TimeBlockMicros(false, nullptr)
++    {
++    }
++
+     TimeBlockMicros(bool enabled, long *slot) :
+         enabled(enabled),
+         slot(slot)
+@@ -121,6 +126,30 @@ struct TimeBlockMicros
+         }
+     }
+ 
++    TimeBlockMicros(const TimeBlockMicros &) = delete;
++    TimeBlockMicros operator=(const TimeBlockMicros &) = delete;
++
++    TimeBlockMicros &operator=(TimeBlockMicros &&other) noexcept
++    {
++        enabled = other.enabled;
++        slot = other.slot;
++        start = other.start;
++
++        other.enabled = false;
++        other.slot = nullptr;
++
++        return *this;
++    }
++
++    TimeBlockMicros(TimeBlockMicros &&other) noexcept :
++        enabled(other.enabled),
++        slot(other.slot),
++        start(other.start)
++    {
++        other.enabled = false;
++        other.slot = nullptr;
++    }
++
+     ~TimeBlockMicros()
+     {
+         if(enabled)
+diff --git a/src/include/tango/server/eventsupplier.h b/src/include/tango/server/eventsupplier.h
+index 277aaffd..625a308c 100644
+--- a/src/include/tango/server/eventsupplier.h
++++ b/src/include/tango/server/eventsupplier.h
+@@ -330,6 +330,7 @@ class ZmqEventSupplier : public EventSupplier
+         }
+     };
+ 
++    std::mutex perf_lock;
+     RingBuffer<PerfMonSample> perf_ring_buffer;
+     bool perf_mon_enabled = false;
+     PerfClock::time_point last_event_timestamp = {};
+diff --git a/src/server/zmqeventsupplier.cpp b/src/server/zmqeventsupplier.cpp
+index a7b33194..afd8f91b 100644
+--- a/src/server/zmqeventsupplier.cpp
++++ b/src/server/zmqeventsupplier.cpp
+@@ -38,6 +38,9 @@
+ 
+ #include <iterator>
+ #include <future>
++#include <thread>
++
++using namespace std::literals::chrono_literals;
+ 
+ #ifdef _TG_WINDOWS_
+   #include <ws2tcpip.h>
+@@ -821,6 +824,7 @@ void ZmqEventSupplier::init_event_cptr(const std::string &event_name)
+ 
+ void ZmqEventSupplier::start_perf_mon()
+ {
++    std::lock_guard<std::mutex> lg{perf_lock};
+     perf_mon_enabled = true;
+     last_event_timestamp = {};
+     perf_ring_buffer.reset();
+@@ -828,11 +832,17 @@ void ZmqEventSupplier::start_perf_mon()
+ 
+ void ZmqEventSupplier::stop_perf_mon()
+ {
++    std::lock_guard<std::mutex> lg{perf_lock};
+     perf_mon_enabled = false;
+ }
+ 
+ void ZmqEventSupplier::query_event_system(std::ostream &os)
+ {
++    // We don't need to lock access to `event_cptr` because the only time the
++    // map is modified is during the DServer::ZmqEventSubscriptionChange command
++    // where we are holding the DServer lock, which we are holding now.  We
++    // might miss an increment of the value from a `push_event`, but that
++    // doesn't really matter.
+     os << "{\"event_counters\":{";
+     {
+         bool first = true;
+@@ -847,10 +857,21 @@ void ZmqEventSupplier::query_event_system(std::ostream &os)
+         }
+     }
+     os << "},\"perf_stats\":";
+-    if(perf_mon_enabled)
++    bool enabled = false;
++    RingBuffer<PerfMonSample> buffer;
+     {
+-        perf_ring_buffer.json_dump(os);
+-        perf_ring_buffer.reset();
++        std::lock_guard<std::mutex> lg{perf_lock};
++        if(perf_mon_enabled)
++        {
++            buffer = perf_ring_buffer;
++            perf_ring_buffer.reset();
++            enabled = true;
++        }
++    }
++
++    if(enabled)
++    {
++        buffer.json_dump(os);
+     }
+     else
+     {
+@@ -1076,18 +1097,6 @@ void ZmqEventSupplier::push_event(DeviceImpl *device_impl,
+                                   DevFailed *except,
+                                   bool inc_cptr)
+ {
+-    PerfMonSample sample;
+-    SamplePusher<PerfMonSample> pusher{perf_mon_enabled, sample, perf_ring_buffer};
+-    TimeBlockMicros perf_mon{perf_mon_enabled, &sample.push_event_micros};
+-    if(perf_mon_enabled)
+-    {
+-        if(last_event_timestamp != PerfClock::time_point{})
+-        {
+-            sample.micros_since_last_event = duration_micros(last_event_timestamp, perf_mon.start);
+-        }
+-        last_event_timestamp = perf_mon.start;
+-    }
+-
+     if(device_impl == NULL)
+     {
+         return;
+@@ -1095,6 +1104,27 @@ void ZmqEventSupplier::push_event(DeviceImpl *device_impl,
+ 
+     TANGO_LOG_DEBUG << "ZmqEventSupplier::push_event(): called for attribute/pipe " << obj_name << std::endl;
+ 
++    PerfMonSample sample;
++    SamplePusher<PerfMonSample> pusher{false, sample, perf_ring_buffer, &perf_lock};
++    TimeBlockMicros perf_mon;
++    bool perf_mon_sampling = false;
++    if(perf_lock.try_lock())
++    {
++        perf_mon_sampling = perf_mon_enabled;
++        perf_mon = TimeBlockMicros{perf_mon_sampling, &sample.push_event_micros};
++
++        if(perf_mon_sampling)
++        {
++            if(last_event_timestamp != PerfClock::time_point{})
++            {
++                sample.micros_since_last_event = duration_micros(last_event_timestamp, perf_mon.start);
++            }
++            last_event_timestamp = perf_mon.start;
++        }
++        perf_lock.unlock();
++    }
++    pusher.enabled = perf_mon_sampling;
++
+     //
+     // Get the mutex to synchronize the sending of events
+     // This method may be called by several threads in case they are several
+-- 
+2.48.1
+
