@@ -15,15 +15,21 @@ monitor a set of Tango devices.
 
 ## Usage
 
-To use the `ska-tango-event-monitor` script, run the following command:
+To install the `ska-tango-event-monitor` script, run the following:
 
 ```sh
-python -m event_monitor.py <device> [options]
+poetry install
+```
+To use the `ska-tango-event-monitor` script,  run the following command from the
+poetry envrionemtn:
+
+```sh
+ska-tango-event-monitor <device> [<device>...] [options]
 ```
 
 ### Arguments
 
-- `device`: The device or admin device to poll (required).
+- `device`: The devices or admin devices to poll (at least 1 required).
 - `--poll-period`: Period between polls in seconds (default: 10.0).
 - `-o, --output`: File to save data to, one JSON object per line (default: None).
 - `-a, --append`: Append to file (default: False).
@@ -31,10 +37,10 @@ python -m event_monitor.py <device> [options]
 ### Example
 
 ```sh
-python -m event_monitor.py my/running/device --poll-period 5 -o output.json
+ska-tango-event-monitor my/running/device my/running/device2 --poll-period 5 -o output.json
 ```
 
-This command will monitor the specified Tango device, polling every 5 seconds, and save the output to `output.json`.
+This command will monitor the specified Tango devices, polling every 5 seconds, and save the output to `output.json`.
 
 ## Additional DServer Commands
 

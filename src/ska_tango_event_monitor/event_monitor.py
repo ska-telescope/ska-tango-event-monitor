@@ -28,22 +28,23 @@ def strl(ev):
     m = regex.match(ev)
     return m.group(1)
 
-def print_stats(sorted_array, name, units=' (μs)'):
-    mean = float(statistics.mean(sorted_array))
-    stdev = float(statistics.pstdev(sorted_array))
-    err = stdev / (len(sorted_array) ** 0.5)
-    minimum = min(sorted_array)
-    maximum = max(sorted_array)
-    try:
-        pc10 = sorted_array[len(sorted_array) // 10]
-        pc50 = sorted_array[len(sorted_array) // 2]
-        pc90 = sorted_array[len(sorted_array) - len(sorted_array) // 10]
-    except:
-        pc10 = None
-        pc50 = None
-        pc90 = None
+def print_stats(data, name, units=' (μs)'):
+    mean = float(statistics.mean(data))
+    stdev = float(statistics.pstdev(data))
+    err = stdev / (len(data) ** 0.5)
+    minimum = min(data)
+    maximum = max(data)
+    median = statistics.median(data)
+    quantiles = f"median={median}"
     name = name + units;
-    print(f"\t{name:>30}: {mean:10.2f}±{err:<10.2f} (count={len(sorted_array)}, min={minimum}, 10%={pc10}, med={pc50}, 90%={pc90} max={maximum})")
+    if len(data) >= 10:
+        deciles = statistics.quantiles(data, n=10)
+        quantiles = f"10%={deciles[0]}, {quantiles}, 90%={deciles[-1]}"
+    if len(data) >= 100:
+        percentiles = statistics.quantiles(data, n=100)
+        quantiles = f"1%={percentiles[0]}, {quantiles}, 99%={percentiles[-1]}"
+    quantiles = f"min={minimum}, {quantiles}, max={maximum}"
+    print(f"\t{name:>30}: {mean:10.2f}±{err:<10.2f} (count={len(data)}, {quantiles})")
 
 def print_summary(name, data, last_data):
     server = data['server']
@@ -69,7 +70,7 @@ def print_summary(name, data, last_data):
     if len(changed) > 0:
         print(f"{name} published events:")
         for ev in changed:
-            print(f"\t{strl(ev)}: {counters[ev] - last_counters[ev]:+}")
+            print(f'\t{strl(ev)}: {last_counters[ev]} -> {counters[ev]} ({counters[ev] - last_counters[ev]:+}) server counter')
 
     if len(removed) > 0:
         print(f"{name} removed publishers:")
@@ -146,6 +147,7 @@ def print_summary(name, data, last_data):
 def main():
     args = build_parser().parse_args()
 
+    display_names = {}
     group = Group("EventQueryGroup")
     for name in args.device:
         display_name = name
@@ -162,7 +164,11 @@ def main():
             sys.exit(1)
 
         if name not in group.get_device_list():
+            display_names[name] = display_name
             group.add(name)
+        else:
+            print(f"Skipping {display_name} as it is the same DServer as {display_names[name]}", file=sys.stderr)
+
 
     last_data = {}
     for name in group.get_device_list():
@@ -208,7 +214,7 @@ def main():
                         line += f'{{"data":{s}}}'
 
                     data = json.loads(s)
-                    print_summary(name, data, last_data[name])
+                    print_summary(display_names[name], data, last_data[name])
                     last_data[name] = data
 
             if output is not None:
