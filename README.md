@@ -100,3 +100,83 @@ The devices can then both be monitored with:
 ```sh
 ska-tango-event-monitor -m "foo/bar/pub" "foo/bar/sub"
 ```
+
+## Pipeline Integration
+
+Currently, this utility and patch wheel are manually applied within shell sessions on pods deployed in both local and ITF clusters. To streamline usage, we propose adding a dedicated job to the test stage. This job will:
+
+* Stream summarized event processing information.
+* Capture and save events transmitted over the ZMQ wire to a file.
+
+This file will contain detailed event data, including device (server) publications, client subscriptions to attributes, and their respective callback counts.
+
+To further simplify management, a make target will be integrated into the ska-cicd-makefile. In the interim, the pipeline structure from [this example pipeline](https://gitlab.com/ska-telescope/ska-mid-dish-manager/-/pipelines/1698758127) can be replicated (for integration environment, wait for make target). **Do the following**:
+
+### Update or Add a Dockerfile to install the built wheel and ska-tango-event-monitor
+
+``` bash
+# ./build-with-custom-whl/Dockerfile
+...
+
+# install custom pytango wheel from gitlab registry
+RUN pip install pytango --force-reinstall --index-url https://gitlab.com/api/v4/projects/67270251/packages/pypi/simple
+RUN pip install numpy==1.26.4
+# install ska-tango-event-monitor from gitlab registry
+RUN pip install ska-tango-event-monitor --index-url https://gitlab.com/api/v4/projects/67270251/packages/pypi/simple
+```
+
+### Point your docker build command to the new dockerfile
+
+```bash
+# ./Makefile
+...
+
+OCI_IMAGE_FILE_PATH = build-with-custom-whl/Dockerfile
+```
+
+### Add jobs to stream and store the events
+
+``` bash
+# .gitlab-ci.yml
+...
+
+stream-processed-zmq-events:
+  tags:
+    - ${SKA_K8S_RUNNER}
+  variables:
+    KUBE_NAMESPACE: 'ci-$CI_PROJECT_NAME-$CI_COMMIT_SHORT_SHA'
+    TARGET_POD_NAME: <the-pod-running-your-device>
+    DEVICE_NAME: <foo/bar/1>
+  allow_failure: true
+  when: always
+  stage: test
+  script:
+    - git clone https://gitlab.com/ska-telescope/sdi/ska-cicd-makefile.git
+    - cd ska-cicd-makefile
+    - KUBE_APP=<k8s-app-label-name> make k8s-wait
+    - echo "Starting ZMQ event monitoring on $DEVICE_NAME in namespace $KUBE_NAMESPACE"
+    - kubectl exec -i $TARGET_POD_NAME -n $KUBE_NAMESPACE -- sudo touch zmq-events.json
+    - kubectl exec -i $TARGET_POD_NAME -n $KUBE_NAMESPACE -- sudo chown tango zmq-events.json
+    - kubectl exec -i $TARGET_POD_NAME -n $KUBE_NAMESPACE -- /app/bin/ska-tango-event-monitor $DEVICE_NAME --append --output zmq-events.json 
+
+stop-streaming-and-store-zmq-events:
+  tags:
+    - ${SKA_K8S_RUNNER}
+  variables:
+    KUBE_NAMESPACE: 'ci-$CI_PROJECT_NAME-$CI_COMMIT_SHORT_SHA'
+    TARGET_POD_NAME: <the-pod-running-your-device>
+  stage: test
+  when: always
+  allow_failure: true
+  script:
+    - echo "Test run has completed, collecting events recorded"
+    - mkdir -p build
+    - kubectl exec -i $TARGET_POD_NAME -n $KUBE_NAMESPACE -- cat zmq-events.json >> build/zmq-events.json
+    - kubectl exec -i $TARGET_POD_NAME -n $KUBE_NAMESPACE -- pkill -f "/app/bin/ska-tango-event-monitor foo/bar/1"
+  needs:
+    - k8s-test-runner
+  artifacts:
+    name: "$CI_JOB_NAME-$CI_JOB_ID-recorded-events"
+    paths:
+      - build/
+```
