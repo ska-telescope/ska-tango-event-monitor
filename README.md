@@ -33,7 +33,7 @@ ska-tango-event-monitor <device> [<device>...] [options]
 - `--poll-period`: Period between polls in seconds (default: 10.0).
 - `-o, --output`: File to save data to, one JSON object per line (default: None).
 - `-a, --append`: Append to file (default: False).
-- '-m', '--monitor-perf': Enable performance monitoring
+- `-m, --monitor-perf`: Enable performance monitoring
 
 ### Example
 
@@ -103,14 +103,35 @@ ska-tango-event-monitor -m "foo/bar/pub" "foo/bar/sub"
 
 ## Pipeline Integration
 
-Currently, this utility and patch wheel are manually applied within shell sessions on pods deployed in both local and ITF clusters. To streamline usage, we propose adding a dedicated job to the test stage. This job will:
+Currently, this utility and patch wheel are manually applied within shell sessions on pods deployed in both local and ITF clusters.
 
-* Stream summarized event processing information.
-* Capture and save events transmitted over the ZMQ wire to a file.
+Multiple Tango device servers can be monitored at once and it is recommend to
+monitor them all with a single monitoring process so that they are sampled at
+the same time.  This makes it easier to correlate the event system query data
+between devices.
+
+Each device which you want to monitor must be run from a pod with the patched
+pytango wheel. The ska-tango-event-monitor python package does _not_ require the
+patched pytango wheel.
+
+To streamline usage, we propose adding a dedicated job to the test stage. This job will:
+
+* Stream summarized event processing information during test execution.
+* Capture and save events transmitted over the ZMQ wire to a file called `zmq-events.json`
 
 This file will contain detailed event data, including device (server) publications, client subscriptions to attributes, and their respective callback counts.
 
-To further simplify management, a make target will be integrated into the ska-cicd-makefile. In the interim, the pipeline structure from [this example pipeline](https://gitlab.com/ska-telescope/ska-mid-dish-manager/-/pipelines/1698758127) can be replicated (for integration environment, wait for make target). **Do the following**:
+To further simplify management, a make target will be integrated into the ska-cicd-makefile. In the interim, the pipeline structure from [this example pipeline](https://gitlab.com/ska-telescope/ska-mid-dish-manager/-/pipelines/1698758127) can be replicated (for integration environment, wait for make target).
+
+**Do the following**:
+
+### Select an ska-tango-event-monitor commit to use
+
+Currently, ska-tango-event-monitor is unreleased and the utility is only
+guaranteed to work with a patched wheel built from the same commit.  Browse the
+package registry
+[here](https://gitlab.com/ska-telescope/ska-tango-event-monitor/-/packages) to
+select a commit from the `main` branch, let's call it `$STEM_SHA`.
 
 ### Update or Add a Dockerfile to install the built wheel and ska-tango-event-monitor
 
@@ -119,10 +140,16 @@ To further simplify management, a make target will be integrated into the ska-ci
 ...
 
 # install custom pytango wheel from gitlab registry
-RUN pip install pytango --force-reinstall --index-url https://gitlab.com/api/v4/projects/67270251/packages/pypi/simple
-RUN pip install numpy==1.26.4
+# each pod containing a device server that wants to be monitored must use the
+# patched version of pytango.  Currently, patched wheels based on 9.5.0 and 9.5.1
+# are available.
+RUN pip install pytango==9.5.0+dev.c${STEM_SHA} --force-reinstall --index-url https://gitlab.com/api/v4/projects/67270251/packages/pypi/simple
+RUN pip install numpy==1.26.4 # Required for pytango 9.5.0
+
 # install ska-tango-event-monitor from gitlab registry
-RUN pip install ska-tango-event-monitor --index-url https://gitlab.com/api/v4/projects/67270251/packages/pypi/simple
+# This package does not require the patched version of pytango, but it is often
+# easiest to run the script from a device server pod
+RUN pip install ska-tango-event-monitor==0.0.0+dev.c${STEM_SHA} --index-url https://gitlab.com/api/v4/projects/67270251/packages/pypi/simple
 ```
 
 ### Point your docker build command to the new dockerfile
@@ -145,8 +172,8 @@ stream-processed-zmq-events:
     - ${SKA_K8S_RUNNER}
   variables:
     KUBE_NAMESPACE: 'ci-$CI_PROJECT_NAME-$CI_COMMIT_SHORT_SHA'
-    TARGET_POD_NAME: <the-pod-running-your-device>
-    DEVICE_NAME: <foo/bar/1>
+    TARGET_POD_NAME: <the-pod-to-run-the-sampling-script>
+    DEVICE_NAMES: "<foo/bar/1> <foo/bar/2> ..."
   allow_failure: true
   when: always
   stage: test
@@ -157,14 +184,14 @@ stream-processed-zmq-events:
     - echo "Starting ZMQ event monitoring on $DEVICE_NAME in namespace $KUBE_NAMESPACE"
     - kubectl exec -i $TARGET_POD_NAME -n $KUBE_NAMESPACE -- sudo touch zmq-events.json
     - kubectl exec -i $TARGET_POD_NAME -n $KUBE_NAMESPACE -- sudo chown tango zmq-events.json
-    - kubectl exec -i $TARGET_POD_NAME -n $KUBE_NAMESPACE -- /app/bin/ska-tango-event-monitor $DEVICE_NAME --append --output zmq-events.json 
+    - kubectl exec -i $TARGET_POD_NAME -n $KUBE_NAMESPACE -- /app/bin/ska-tango-event-monitor $DEVICE_NAMES --monitor-perf --append --output zmq-events.json 
 
 stop-streaming-and-store-zmq-events:
   tags:
     - ${SKA_K8S_RUNNER}
   variables:
     KUBE_NAMESPACE: 'ci-$CI_PROJECT_NAME-$CI_COMMIT_SHORT_SHA'
-    TARGET_POD_NAME: <the-pod-running-your-device>
+    TARGET_POD_NAME: <the-pod-to-run-the-sampling-script>
   stage: test
   when: always
   allow_failure: true
@@ -172,7 +199,7 @@ stop-streaming-and-store-zmq-events:
     - echo "Test run has completed, collecting events recorded"
     - mkdir -p build
     - kubectl exec -i $TARGET_POD_NAME -n $KUBE_NAMESPACE -- cat zmq-events.json >> build/zmq-events.json
-    - kubectl exec -i $TARGET_POD_NAME -n $KUBE_NAMESPACE -- pkill -f "/app/bin/ska-tango-event-monitor foo/bar/1"
+    - kubectl exec -i $TARGET_POD_NAME -n $KUBE_NAMESPACE -- pkill -f "/app/bin/ska-tango-event-monitor"
   needs:
     - k8s-test-runner
   artifacts:
