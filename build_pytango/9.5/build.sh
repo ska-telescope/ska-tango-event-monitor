@@ -11,7 +11,7 @@ set -ex
 
 docker_args="--build-arg PYTANGO_VERSION=${pytango_version}"
 if [[ -n "${CI_COMMIT_SHORT_SHA}" ]]; then
-    docker_args+="--build-arg CI_COMMIT_SHORT_SHA=${CI_COMMIT_SHORT_SHA}"
+    docker_args+=" --build-arg CI_COMMIT_SHORT_SHA=${CI_COMMIT_SHORT_SHA}"
 fi
 
 docker build -t ${build_image} ${SCRIPT_DIR} ${docker_args}
